@@ -23,6 +23,10 @@ from .prompts import return_instructions_root
 
 load_dotenv()
 
+rag_corpus_path = os.environ.get("RAG_CORPUS")
+if not rag_corpus_path:
+    raise ValueError("RAG_CORPUS environment variable must be set. Example: projects/123/locations/us-central1/ragCorpora/456")
+
 ask_vertex_retrieval = VertexAiRagRetrieval(
     name='retrieve_rag_documentation',
     description=(
@@ -33,7 +37,7 @@ ask_vertex_retrieval = VertexAiRagRetrieval(
             # please fill in your own rag corpus
             # here is a sample rag corpus for testing purpose
             # e.g. projects/123/locations/us-central1/ragCorpora/456
-            rag_corpus=os.environ.get("RAG_CORPUS")
+            rag_corpus=rag_corpus_path
         )
     ],
     similarity_top_k=10,

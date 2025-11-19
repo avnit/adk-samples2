@@ -1,7 +1,14 @@
 import os
 import requests
 import json
-from typing import Dict, Any, Optional, Union, Callable # Added Callable
+import time
+import base64
+from dataclasses import dataclass
+from typing import Dict, Any, Optional, Union, Callable
+
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.models import LlmResponse
+
 # --- Wiz API Configuration ---
 WIZ_CLIENT_ID = os.environ.get("WIZ_CLIENT_ID")
 WIZ_CLIENT_SECRET = os.environ.get("WIZ_CLIENT_SECRET")
@@ -9,6 +16,16 @@ DEFAULT_WIZ_AUTH_URL = "https://auth.wiz.io/oauth/token"
 # Default Wiz API Base URL - adjust if your Wiz instance is in a specific region e.g., https://api.us1.wiz.io
 DEFAULT_WIZ_API_BASE_URL = "https://api.wiz.io"
 DEFAULT_WIZ_GQL_PATH = "/graphql" # Common path for GraphQL queries
+
+
+@dataclass
+class AuthResult:
+    """Result of authentication with the Wiz API."""
+    auth_headers: Dict[str, str]
+    data_center: str
+    env: str
+
+
 class WizQueryAgent:
     def __init__(self,
                  name: str = 'WizQueryAgent',
@@ -19,11 +36,16 @@ class WizQueryAgent:
                  wiz_api_base_url: str = DEFAULT_WIZ_API_BASE_URL):
         self.name = name
         self.description = description
-        self.access_token: Optional[str] = None
         self.default_query = default_query if default_query else self._get_default_graphql_query()
         self.default_endpoint = default_endpoint
         self.default_method = default_method
         self.wiz_api_base_url = wiz_api_base_url
+        
+        # Auth cache
+        self._access_token: Optional[str] = None
+        self._token_expiry: Optional[float] = None
+        self._data_center: Optional[str] = None
+        
         print(f"{self.name} initialized. Ready to act as an ADK callback.")
 
     def _get_default_graphql_query(self) -> Dict[str, Any]:
@@ -60,11 +82,86 @@ class WizQueryAgent:
             }
         }
 
-    def _ensure_token(self) -> bool:
-        """Ensures a valid access token is available."""
-        if not self.access_token:
-            self.access_token = _get_wiz_access_token()
-        return self.access_token is not None
+    def _pad_base64(self, base64_str: str) -> str:
+        """Pad a base64 string to a multiple of 4."""
+        remainder = len(base64_str) % 4
+        if remainder == 0:
+            return base64_str
+        return base64_str + "=" * (4 - remainder)
+
+    def _authenticate(self) -> Optional[AuthResult]:
+        """Authenticate with the Wiz API with caching."""
+        # Check if we have a valid cached token
+        current_time = time.time()
+        env = os.environ.get("WIZ_ENV", "app")
+        
+        if self._access_token and self._token_expiry and self._data_center and current_time < self._token_expiry:
+            # print(f"{self.name}: Using cached access token")
+            return AuthResult(
+                auth_headers={"Authorization": f"Bearer {self._access_token}"},
+                data_center=self._data_center,
+                env=env
+            )
+
+        # Get client ID and secret from environment variables
+        client_id = WIZ_CLIENT_ID
+        client_secret = WIZ_CLIENT_SECRET
+        
+        if not client_id or not client_secret:
+            print(f"{self.name} Error: WIZ_CLIENT_ID and WIZ_CLIENT_SECRET environment variables must be set.")
+            return None
+
+        # Authenticate with the Wiz API
+        print(f"{self.name}: Authenticating with the Wiz API...")
+        
+        auth_url = f"https://auth.{env}.wiz.io/oauth/token"
+        payload = {
+            "grant_type": "client_credentials",
+            "audience": "wiz-api",
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+
+        try:
+            response = requests.post(auth_url, data=payload, headers=headers, timeout=60)
+            response.raise_for_status()
+            auth_data = response.json()
+
+            # Extract the access token and expiry time
+            self._access_token = auth_data["access_token"]
+            self._token_expiry = time.time() + auth_data["expires_in"] - 60  # Subtract 60 seconds for safety
+
+            # Extract the data center from the JWT token
+            token_parts = self._access_token.split(".")
+            if len(token_parts) >= 2:
+                # Decode the JWT payload
+                payload_part = token_parts[1]
+                padded_payload = self._pad_base64(payload_part)
+                decoded_payload = base64.b64decode(padded_payload)
+                payload_data = json.loads(decoded_payload)
+
+                # Extract the data center
+                self._data_center = payload_data.get("dc", "us1")
+            else:
+                self._data_center = "us1"
+
+            print(f"{self.name}: Successfully authenticated with the Wiz API (DC: {self._data_center})")
+
+            return AuthResult(
+                auth_headers={"Authorization": f"Bearer {self._access_token}"},
+                data_center=self._data_center,
+                env=env
+            )
+
+        except requests.exceptions.RequestException as e:
+            print(f"{self.name} Error during authentication: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"{self.name} Error Response content: {e.response.text}")
+            return None
+        except Exception as e:
+            print(f"{self.name} Unexpected error during authentication: {e}")
+            return None
 
     def fetch_wiz_data(self,
                        endpoint: str,
@@ -72,8 +169,9 @@ class WizQueryAgent:
                        payload: Optional[Dict[str, Any]] = None
                        ) -> Optional[Union[Dict[str, Any], list]]:
         """A reusable method to fetch data from Wiz."""
-        if not self._ensure_token() or not self.access_token:
-            print(f"{self.name}: Cannot fetch Wiz data, authentication failed or token not available.")
+        auth_result = self._authenticate()
+        if not auth_result:
+            print(f"{self.name}: Cannot fetch Wiz data, authentication failed.")
             return None
 
         json_body_to_send = None
@@ -84,120 +182,80 @@ class WizQueryAgent:
         else: # GET, DELETE etc.
             query_params_to_send = payload
 
-        return _make_wiz_api_request(
-            base_api_url=self.wiz_api_base_url,
-            endpoint_path=endpoint,
-            access_token=self.access_token,
-            method=method,
-            query_params=query_params_to_send,
-            json_body=json_body_to_send
-        )
-
-        def __call__(self, callback_context: CallbackContext, llm_response: LlmResponse) -> Optional[LlmResponse]:
-            """
-            ADK callback method. Fetches Wiz data and appends it to the LlmResponse.
-            The parameter names 'callback_context' and 'llm_response' must match
-            how the ADK framework calls this callback.
-            """
-            #print(f"{self.name} (callback) received LLM response ID: {llm_response.id}. Invocation ID: {callback_context.invocation_id}") # Changed context to callback_context
-
-            wiz_query_payload = self.default_query
-            wiz_endpoint = self.default_endpoint
-            wiz_method = self.default_method
-
-            print(f"{self.name}: Using Wiz query payload: {json.dumps(wiz_query_payload)[:200]}...")
-
-            wiz_results = self.fetch_wiz_data(
-                endpoint=wiz_endpoint,
-                method=wiz_method,
-                payload=wiz_query_payload
-            )
-            return llm_response
-
-# --- Internal Helper Functions ---
-def _get_wiz_access_token(
-    auth_url: str = DEFAULT_WIZ_AUTH_URL,
-    client_id: Optional[str] = WIZ_CLIENT_ID,
-    client_secret: Optional[str] = WIZ_CLIENT_SECRET
-) -> Optional[str]:
-    """Authenticates with the Wiz API to get an access token."""
-    if not client_id or not client_secret:
-        print("WizAgent Error: WIZ_CLIENT_ID and WIZ_CLIENT_SECRET environment variables must be set.")
-        return None
-
-    payload = {
-        "grant_type": "client_credentials",
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "audience": "wiz-api"  # Common audience for Wiz API
-    }
-    headers = {"Content-Type": "application/x-www-form-urlencoded"}
-
-    try:
-        print(f"WizAgent: Attempting to get access token from: {auth_url}")
-        response = requests.post(auth_url, data=payload, headers=headers)
-        response.raise_for_status()
-        token_data = response.json()
-        access_token = token_data.get("access_token")
-        if access_token:
-            print("WizAgent: Successfully obtained access token.")
-            return access_token
+        # Construct URL based on data center if needed, or use provided base URL
+        # Note: The original code used a fixed base URL or one passed in init.
+        # wiz-mcp uses dynamic URL based on DC, but here we stick to the init param 
+        # unless we want to support multi-region dynamically. 
+        # For now, let's use the base_url from init but we could update it if we wanted to use the DC.
+        # However, to be safe and consistent with previous behavior, we use wiz_api_base_url.
+        
+        if not endpoint.startswith("/"):
+            full_url = f"{self.wiz_api_base_url}/{endpoint}"
         else:
-            print(f"WizAgent Error: Access token not found in response. Response: {response.text}")
+            full_url = f"{self.wiz_api_base_url}{endpoint}"
+
+        headers = auth_result.auth_headers
+        headers["Content-Type"] = "application/json"
+
+        try:
+            print(f"{self.name}: Making {method.upper()} request to: {full_url}")
+            # if query_params_to_send: print(f"{self.name}: With query params: {query_params_to_send}")
+            # if json_body_to_send: print(f"{self.name}: With JSON body: {json.dumps(json_body_to_send)[:200]}...")
+
+            response = requests.request(
+                method.upper(), 
+                full_url, 
+                headers=headers, 
+                params=query_params_to_send, 
+                json=json_body_to_send,
+                timeout=60
+            )
+            response.raise_for_status()
+
+            if response.status_code == 204: # No Content
+                return {}
+            return response.json()
+
+        except requests.exceptions.HTTPError as e:
+            print(f"{self.name} HTTP Error during API request to {full_url}: {e}")
+            if e.response is not None:
+                print(f"{self.name} Error Response content: {e.response.text}")
             return None
-    except requests.exceptions.RequestException as e:
-        print(f"WizAgent Error during authentication: {e}")
-        if hasattr(e, 'response') and e.response is not None:
-            print(f"WizAgent Error Response content: {e.response.text}")
-        return None
+        except requests.exceptions.RequestException as e:
+            print(f"{self.name} RequestException during API request to {full_url}: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            print(f"{self.name} Error: Failed to decode JSON response from API: {full_url} - {e}")
+            return None
 
-def _make_wiz_api_request(
-    base_api_url: str,
-    endpoint_path: str,
-    access_token: str,
-    method: str = "GET",
-    query_params: Optional[Dict[str, Any]] = None,
-    json_body: Optional[Dict[str, Any]] = None
-) -> Optional[Union[Dict[str, Any], list]]: # Can return dict or list
-    """Makes an authenticated request to a specified Wiz API endpoint."""
-    if not endpoint_path.startswith("/"):
-        full_url = f"{base_api_url}/{endpoint_path}"
-    else:
-        full_url = f"{base_api_url}{endpoint_path}"
+    def __call__(self, callback_context: CallbackContext, llm_response: LlmResponse) -> Optional[LlmResponse]:
+        """
+        ADK callback method. Fetches Wiz data and appends it to the LlmResponse.
+        """
+        wiz_query_payload = self.default_query
+        wiz_endpoint = self.default_endpoint
+        wiz_method = self.default_method
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
+        print(f"{self.name}: Using Wiz query payload: {json.dumps(wiz_query_payload)[:200]}...")
 
-    response_obj = None # To store the response object for logging in case of JSONDecodeError
-    try:
-        print(f"WizAgent: Making {method.upper()} request to: {full_url}")
-        if query_params: print(f"WizAgent: With query params: {query_params}")
-        if json_body: print(f"WizAgent: With JSON body: {json.dumps(json_body)[:200]}...")
+        wiz_results = self.fetch_wiz_data(
+            endpoint=wiz_endpoint,
+            method=wiz_method,
+            payload=wiz_query_payload
+        )
+        
+        if wiz_results:
+             # Append findings to the response or context as needed.
+             # For this example, we'll just print them or attach to output_data if ADK supports it
+             # or append to text.
+             # The original code didn't actually *do* anything with wiz_results in __call__ other than return llm_response.
+             # Let's assume we want to attach it to the response somehow.
+             # Since the original code just returned llm_response, we will do the same but maybe log it.
+             print(f"{self.name}: Retrieved {len(wiz_results.get('data', {}).get('issues', {}).get('nodes', []))} issues.")
+             
+             # Optionally append to llm_response text or metadata
+             # llm_response.output_data['wiz_findings'] = wiz_results # If supported
+             pass
+             
+        return llm_response
 
-        response_obj = requests.request(method.upper(), full_url, headers=headers, params=query_params, json=json_body)
-        response_obj.raise_for_status() # Raises HTTPError for bad responses (4XX or 5XX)
-
-        if response_obj.status_code == 204: # No Content
-            return {}
-        return response_obj.json()
-
-    except requests.exceptions.HTTPError as e:
-        print(f"WizAgent HTTP Error during API request to {full_url}: {e}")
-        if e.response is not None:
-            print(f"WizAgent Error Response content: {e.response.text}")
-        return None
-    except requests.exceptions.RequestException as e: # For other network/DNS issues etc.
-        print(f"WizAgent RequestException during API request to {full_url}: {e}")
-        return None
-    except json.JSONDecodeError as e:
-        print(f"WizAgent Error: Failed to decode JSON response from API: {full_url} - {e}")
-        if response_obj is not None:
-            try:
-                print(f"WizAgent Error: Response content that failed to parse: {response_obj.text}")
-            except Exception as text_ex:
-                print(f"WizAgent Error: Could not get text from response object: {text_ex}")
-        return None
-
-# --- WizQueryAgent (Callable Class for ADK Callback) ---

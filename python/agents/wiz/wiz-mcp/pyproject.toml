@@ -24,7 +24,7 @@ requires-python = ">=3.10"
 dependencies = [
     "mcp[cli]==1.6.0",
     "httpx==0.28.1",
-    "python-dotenv==1.1.0",
+    "python-dotenv==1.2.2",
     "pyyaml==6.0.2",
 ]
 

@@ -53,3 +53,24 @@ This project is licensed under the Apache 2.0 License - see the [LICENSE](https:
 This is not an officially supported Google product. This project is not eligible for the [Google Open Source Software Vulnerability Rewards Program](https://bughunters.google.com/open-source-security).
 
 This project is intended for demonstration purposes only. It is not intended for use in a production environment.
+
+<!-- ARCH-DIAGRAM:START -->
+
+## Architecture
+
+> Auto-generated architecture diagram. See [`docs/context-map.md`](docs/context-map.md) for the full context map (core application, containers/cloud, and database connections).
+
+```mermaid
+flowchart TD
+  User([User / Client])
+  App["adk-samples2<br/><small>agent.py</small><br/>FastAPI + Uvicorn"]
+  AI["Vertex AI / Gemini<br/>(LLM / Agent Engine)"]
+  Img["Container image<br/>(Docker)"]
+  Deploy["GKE / Kubernetes"]
+  User --> App
+  App --> AI
+  App -.deploy.-> Img
+  Img -.deploy.-> Deploy
+```
+
+<!-- ARCH-DIAGRAM:END -->
